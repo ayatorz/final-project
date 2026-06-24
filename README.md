@@ -1,4 +1,25 @@
 # final-project
+
+## NNプログラムの実行方法
+
+`music_artist_dataset_template.csv`を使って、歌詞行からアーティストを分類するニューラルネットワークを学習し、短い歌詞風テキストの生成と分類器による判定を行います。
+データは同じ曲が複数の分割に混ざらないように、アーティストごとに曲単位で`train:valid:test = 3:1:1`へ分割します。
+
+```bash
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+python3 nn_music_project.py --use-title
+```
+
+主な出力は`outputs/`に保存されます。
+
+- `artist_classifier.pkl`: 学習済み分類モデル
+- `split_summary.json`: 学習用、検証用、テスト用に入った曲名一覧
+- `splits/train.csv`, `splits/valid.csv`, `splits/test.csv`: 分割後のデータ
+- `classification_metrics.json`: 正解率、混同行列、誤分類例
+- `generated_texts.json`: 生成した短文
+- `generated_predictions.json`: 生成文を分類器に入力した結果
+
 ## うんちち
 
 ### ヨルシカ
