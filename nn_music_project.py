@@ -149,8 +149,9 @@ def train_classifier(
             (
                 "vectorizer",
                 TfidfVectorizer(
-                    analyzer="char",
-                    ngram_range=(1, 3),
+                    analyzer="word",
+                    token_pattern=r"(?u)\S+",
+                    ngram_range=(1, 2),
                     max_features=max_features,
                     lowercase=False,
                     sublinear_tf=True,
@@ -186,7 +187,7 @@ def train_classifier(
         "valid_rows": len(x_valid),
         "test_rows": len(x_test),
         "use_title": use_title,
-        "vectorizer": "character 1-3gram TF-IDF",
+        "vectorizer": "word 1-2gram TF-IDF",
         "classifier": "MLPClassifier hidden_layer_sizes=(64, 32)",
         "artist_counts": dict(Counter(all_labels)),
         "valid_accuracy": accuracy_score(y_valid, valid_pred),
@@ -224,23 +225,23 @@ def collect_misclassified(
 
 
 @dataclass
-class CharNgramGenerator:
-    order: int = 4
+class WordNgramGenerator:
+    order: int = 2
 
     def __post_init__(self) -> None:
-        self.table: dict[str, Counter[str]] = defaultdict(Counter)
-        self.starts: list[str] = []
+        self.table: dict[tuple[str, ...], Counter[str]] = defaultdict(Counter)
+        self.starts: list[tuple[str, ...]] = []
 
     def fit(self, texts: list[str]) -> None:
-        pad = "\n" * self.order
+        pad = ["<BOS>"] * self.order
         for text in texts:
-            clean = normalize_text(text)
-            if not clean:
+            words = normalize_text(text).split()
+            if not words:
                 continue
-            sequence = pad + clean + "\n"
-            self.starts.append(sequence[: self.order])
+            sequence = pad + words + ["<EOS>"]
+            self.starts.append(tuple(sequence[: self.order]))
             for i in range(len(sequence) - self.order):
-                key = sequence[i : i + self.order]
+                key = tuple(sequence[i : i + self.order])
                 nxt = sequence[i + self.order]
                 self.table[key][nxt] += 1
 
@@ -248,39 +249,40 @@ class CharNgramGenerator:
         if not self.table:
             raise ValueError("generator has not been fitted")
 
-        state = ("\n" * self.order + normalize_text(seed))[-self.order :]
-        output = list(normalize_text(seed))
+        seed_words = normalize_text(seed).split()
+        state_words = (["<BOS>"] * self.order + seed_words)[-self.order :]
+        state = tuple(state_words)
+        output = seed_words[:]
+
         for _ in range(length):
             counter = self.table.get(state)
             if not counter:
                 state = random.choice(self.starts)
                 counter = self.table[state]
 
-            chars = list(counter)
-            weights = np.array([counter[ch] for ch in chars], dtype=np.float64)
+            words = list(counter)
+            weights = np.array([counter[word] for word in words], dtype=np.float64)
             weights = np.power(weights, 1.0 / max(temperature, 1e-6))
             weights = weights / weights.sum()
-            nxt = random.choices(chars, weights=weights, k=1)[0]
+            nxt = random.choices(words, weights=weights, k=1)[0]
 
-            if nxt == "\n":
-                if output and output[-1] not in "。！？!?":
-                    output.append("。")
+            if nxt == "<EOS>":
                 break
 
             output.append(nxt)
-            state = (state + nxt)[-self.order :]
+            state = tuple((list(state) + [nxt])[-self.order :])
 
-        return "".join(output).strip()
+        return " ".join(output).strip()
 
 
-def train_generators(rows: list[dict[str, str]], order: int) -> dict[str, CharNgramGenerator]:
+def train_generators(rows: list[dict[str, str]], order: int) -> dict[str, WordNgramGenerator]:
     texts_by_artist: dict[str, list[str]] = defaultdict(list)
     for row in rows:
         texts_by_artist[row["artist"]].append(row["text"])
 
     generators = {}
     for artist, texts in texts_by_artist.items():
-        generator = CharNgramGenerator(order=order)
+        generator = WordNgramGenerator(order=order)
         generator.fit(texts)
         generators[artist] = generator
     return generators
@@ -387,7 +389,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a neural-network artist classifier and generate short lyric-like text.",
+        description="Train a word-based neural-network artist classifier and generate short lyric-like text.",
     )
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
     parser.add_argument("--use-title", action="store_true", help="Add song title to classifier input.")
@@ -396,9 +398,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-songs", type=int, default=1, help="Songs per artist for testing.")
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--max-features", type=int, default=5000)
-    parser.add_argument("--order", type=int, default=4, help="Character n-gram order for generation.")
+    parser.add_argument("--order", type=int, default=2, help="Word n-gram order for generation.")
     parser.add_argument("--seed-text", default="夜", help="Beginning text for generation.")
-    parser.add_argument("--generate-length", type=int, default=40)
+    parser.add_argument("--generate-length", type=int, default=12, help="Maximum number of generated words.")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--samples", type=int, default=3)
     return parser.parse_args()
