@@ -132,6 +132,123 @@ def save_split_csvs(splits: dict[str, list[dict[str, str]]], output_dir: Path) -
             writer.writerows(split_rows)
 
 
+def collect_artist_keywords(
+    rows: list[dict[str, str]],
+    *,
+    limit: int,
+    max_features: int,
+) -> dict[str, list[dict[str, object]]]:
+    texts_by_artist: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        texts_by_artist[row["artist"]].append(row["text"])
+
+    artists = sorted(texts_by_artist)
+    artist_documents = [" ".join(texts_by_artist[artist]) for artist in artists]
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        token_pattern=r"(?u)\S+",
+        ngram_range=(1, 1),
+        max_features=max_features,
+        lowercase=False,
+        sublinear_tf=True,
+    )
+    scores = vectorizer.fit_transform(artist_documents).toarray()
+    words = np.array(vectorizer.get_feature_names_out())
+
+    keywords: dict[str, list[dict[str, object]]] = {}
+    for artist, artist_scores in zip(artists, scores):
+        ranked_indices = np.argsort(artist_scores)[::-1]
+        top_keywords = []
+        for index in ranked_indices:
+            score = float(artist_scores[index])
+            if score <= 0:
+                break
+            top_keywords.append({"word": str(words[index]), "score": score})
+            if len(top_keywords) >= limit:
+                break
+        keywords[artist] = top_keywords
+
+    return keywords
+
+
+def collect_artist_accuracy(
+    y_true: list[str],
+    y_pred: list[str],
+) -> dict[str, dict[str, object]]:
+    results = {}
+    labels = sorted(set(y_true))
+    for label in labels:
+        total = sum(true_label == label for true_label in y_true)
+        correct = sum(
+            true_label == label and predicted_label == label
+            for true_label, predicted_label in zip(y_true, y_pred)
+        )
+        results[label] = {
+            "correct": correct,
+            "total": total,
+            "accuracy": correct / total if total else 0.0,
+        }
+    return results
+
+
+def collect_confusion_summary(
+    labels: list[str],
+    matrix: list[list[int]],
+) -> dict[str, dict[str, int]]:
+    summary = {}
+    for true_label, row in zip(labels, matrix):
+        predicted_counts = {}
+        for predicted_label, count in zip(labels, row):
+            if count:
+                predicted_counts[predicted_label] = int(count)
+        summary[true_label] = predicted_counts
+    return summary
+
+
+def evaluate_song_majority_vote(
+    classifier: Pipeline,
+    rows: list[dict[str, str]],
+    *,
+    use_title: bool,
+) -> dict[str, object]:
+    x, _ = build_inputs(rows, use_title)
+    predictions = classifier.predict(x)
+
+    grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for row, predicted_label in zip(rows, predictions):
+        grouped[(row["artist"], row["title"])].append(str(predicted_label))
+
+    song_results = []
+    correct = 0
+    for (true_artist, title), predicted_labels in sorted(grouped.items()):
+        vote_counts = Counter(predicted_labels)
+        predicted_artist = sorted(
+            vote_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[0][0]
+        is_correct = predicted_artist == true_artist
+        if is_correct:
+            correct += 1
+        song_results.append(
+            {
+                "title": title,
+                "true_artist": true_artist,
+                "predicted_artist": predicted_artist,
+                "correct": is_correct,
+                "line_count": len(predicted_labels),
+                "votes": dict(sorted(vote_counts.items())),
+            }
+        )
+
+    total = len(song_results)
+    return {
+        "song_count": total,
+        "correct_songs": correct,
+        "song_accuracy": correct / total if total else 0.0,
+        "songs": song_results,
+    }
+
+
 def train_classifier(
     splits: dict[str, list[dict[str, str]]],
     *,
@@ -180,6 +297,8 @@ def train_classifier(
     labels = sorted(set(all_labels))
     valid_pred = model.predict(x_valid)
     test_pred = model.predict(x_test)
+    test_pred_labels = [str(label) for label in test_pred]
+    test_confusion_matrix = confusion_matrix(y_test, test_pred, labels=labels).tolist()
 
     metrics: dict[str, object] = {
         "dataset_rows": sum(len(split_rows) for split_rows in splits.values()),
@@ -193,7 +312,9 @@ def train_classifier(
         "valid_accuracy": accuracy_score(y_valid, valid_pred),
         "test_accuracy": accuracy_score(y_test, test_pred),
         "labels": labels,
-        "confusion_matrix": confusion_matrix(y_test, test_pred, labels=labels).tolist(),
+        "artist_accuracy": collect_artist_accuracy(y_test, test_pred_labels),
+        "confusion_matrix": test_confusion_matrix,
+        "confusion_summary": collect_confusion_summary(labels, test_confusion_matrix),
         "classification_report": classification_report(
             y_test,
             test_pred,
@@ -332,6 +453,13 @@ def run(args: argparse.Namespace) -> None:
     save_split_csvs(splits, OUTPUT_DIR)
     save_json(OUTPUT_DIR / "split_summary.json", split_summary)
 
+    artist_keywords = collect_artist_keywords(
+        splits["train"],
+        limit=args.keyword_count,
+        max_features=args.max_features,
+    )
+    save_json(OUTPUT_DIR / "artist_keywords.json", artist_keywords)
+
     classifier, metrics = train_classifier(
         splits,
         use_title=args.use_title,
@@ -342,17 +470,27 @@ def run(args: argparse.Namespace) -> None:
         pickle.dump(classifier, f)
     save_json(OUTPUT_DIR / "classification_metrics.json", metrics)
 
-    generators = train_generators(splits["train"], order=args.order)
-    generated: dict[str, list[str]] = {}
-    for artist, generator in generators.items():
-        generated[artist] = [
-            generator.generate(args.seed_text, length=args.generate_length, temperature=args.temperature)
-            for _ in range(args.samples)
-        ]
-    save_json(OUTPUT_DIR / "generated_texts.json", generated)
+    song_vote_metrics = None
+    if args.song_vote:
+        song_vote_metrics = evaluate_song_majority_vote(
+            classifier,
+            splits["test"],
+            use_title=args.use_title,
+        )
+        save_json(OUTPUT_DIR / "song_vote_metrics.json", song_vote_metrics)
 
-    generated_predictions = predict_generated_texts(classifier, generated)
-    save_json(OUTPUT_DIR / "generated_predictions.json", generated_predictions)
+    # Text generation is intentionally disabled for this classification-focused version.
+    # generators = train_generators(splits["train"], order=args.order)
+    # generated: dict[str, list[str]] = {}
+    # for artist, generator in generators.items():
+    #     generated[artist] = [
+    #         generator.generate(args.seed_text, length=args.generate_length, temperature=args.temperature)
+    #         for _ in range(args.samples)
+    #     ]
+    # save_json(OUTPUT_DIR / "generated_texts.json", generated)
+    #
+    # generated_predictions = predict_generated_texts(classifier, generated)
+    # save_json(OUTPUT_DIR / "generated_predictions.json", generated_predictions)
 
     print("=== Artist classifier ===")
     print(f"rows: {metrics['dataset_rows']}")
@@ -366,6 +504,37 @@ def run(args: argparse.Namespace) -> None:
     print(f"test accuracy: {metrics['test_accuracy']:.3f}")
     print("labels:", ", ".join(metrics["labels"]))
     print()
+    print("=== Artist accuracy ===")
+    for artist, result in metrics["artist_accuracy"].items():
+        print(
+            f"{artist}:",
+            f"{result['accuracy']:.3f}",
+            f"({result['correct']}/{result['total']})",
+        )
+    print()
+    print("=== Confusion summary ===")
+    for true_artist, predicted_counts in metrics["confusion_summary"].items():
+        counts = ", ".join(
+            f"{predicted_artist}={count}"
+            for predicted_artist, count in predicted_counts.items()
+        )
+        print(f"{true_artist} -> {counts}")
+    print()
+    if song_vote_metrics is not None:
+        print("=== Song majority vote ===")
+        print(
+            "song accuracy:",
+            f"{song_vote_metrics['song_accuracy']:.3f}",
+            f"({song_vote_metrics['correct_songs']}/{song_vote_metrics['song_count']})",
+        )
+        for song in song_vote_metrics["songs"]:
+            mark = "OK" if song["correct"] else "NG"
+            print(
+                f"{mark} {song['title']}:",
+                f"true={song['true_artist']}",
+                f"predicted={song['predicted_artist']}",
+            )
+        print()
     print("=== Song split ===")
     for artist, artist_splits in split_summary["songs"].items():
         print(
@@ -375,21 +544,29 @@ def run(args: argparse.Namespace) -> None:
             f"test={', '.join(artist_splits['test'])}",
         )
     print()
-    print("=== Generated samples ===")
-    for item in generated_predictions[: args.samples * len(generators)]:
-        print(f"[{item['target_artist']}] -> predicted {item['predicted_artist']}: {item['text']}")
+    print("=== Artist keywords ===")
+    for artist, keywords in artist_keywords.items():
+        top_words = [str(item["word"]) for item in keywords]
+        print(f"{artist}: {', '.join(top_words)}")
     print()
+    # print("=== Generated samples ===")
+    # for item in generated_predictions[: args.samples * len(generators)]:
+    #     print(f"[{item['target_artist']}] -> predicted {item['predicted_artist']}: {item['text']}")
+    # print()
     print(f"saved: {OUTPUT_DIR / 'artist_classifier.pkl'}")
     print(f"saved: {OUTPUT_DIR / 'split_summary.json'}")
     print(f"saved: {OUTPUT_DIR / 'splits'}")
     print(f"saved: {OUTPUT_DIR / 'classification_metrics.json'}")
-    print(f"saved: {OUTPUT_DIR / 'generated_texts.json'}")
-    print(f"saved: {OUTPUT_DIR / 'generated_predictions.json'}")
+    print(f"saved: {OUTPUT_DIR / 'artist_keywords.json'}")
+    if song_vote_metrics is not None:
+        print(f"saved: {OUTPUT_DIR / 'song_vote_metrics.json'}")
+    # print(f"saved: {OUTPUT_DIR / 'generated_texts.json'}")
+    # print(f"saved: {OUTPUT_DIR / 'generated_predictions.json'}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a word-based neural-network artist classifier and generate short lyric-like text.",
+        description="Train a word-based neural-network artist classifier and analyze artist predictions.",
     )
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
     parser.add_argument("--use-title", action="store_true", help="Add song title to classifier input.")
@@ -398,11 +575,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-songs", type=int, default=1, help="Songs per artist for testing.")
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--max-features", type=int, default=5000)
-    parser.add_argument("--order", type=int, default=2, help="Word n-gram order for generation.")
-    parser.add_argument("--seed-text", default="夜", help="Beginning text for generation.")
-    parser.add_argument("--generate-length", type=int, default=12, help="Maximum number of generated words.")
-    parser.add_argument("--temperature", type=float, default=0.9)
-    parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument("--keyword-count", type=int, default=15, help="Important words to show per artist.")
+    parser.add_argument("--song-vote", action="store_true", help="Evaluate test songs by majority vote.")
+    # Generation options are disabled in this classification-focused version.
+    # parser.add_argument("--order", type=int, default=2, help="Word n-gram order for generation.")
+    # parser.add_argument("--seed-text", default="夜", help="Beginning text for generation.")
+    # parser.add_argument("--generate-length", type=int, default=12, help="Maximum number of generated words.")
+    # parser.add_argument("--temperature", type=float, default=0.9)
+    # parser.add_argument("--samples", type=int, default=3)
     return parser.parse_args()
 
 
