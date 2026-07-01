@@ -24,9 +24,11 @@ python3 nn_music_project.py --use-title
 正直、今の生成部分はおもんないです。原因はかなり明確で、これは「歌詞生成AI」というより 既存歌詞の文字列を確率的になぞる n-gram 生成器 になっています。
 特にここです。
 [final-project/nn_music_project.py (line 227)](/Users/ryo/dnn/final-project/nn_music_project.py:227)
+```python
 @dataclass
 class CharNgramGenerator:
     order: int = 4
+```
 order=4 なので、「直前4文字を見て、次の1文字を選ぶ」だけです。学習データが722行くらいで、各行も短いので、直前4文字が一致したら次に来る文字がほぼ一意に決まります。その結果、生成文が既存歌詞の行をそのまま再生しやすいです。
 実際に実行結果もこうなっています。
 ペルセウス座流星群 君も見てただろうか。
