@@ -20,6 +20,41 @@ python3 nn_music_project.py --use-title
 - `generated_texts.json`: 生成した短文
 - `generated_predictions.json`: 生成文を分類器に入力した結果
 
+---
+正直、今の生成部分はおもんないです。原因はかなり明確で、これは「歌詞生成AI」というより 既存歌詞の文字列を確率的になぞる n-gram 生成器 になっています。
+特にここです。
+[final-project/nn_music_project.py (line 227)](/Users/ryo/dnn/final-project/nn_music_project.py:227)
+@dataclass
+class CharNgramGenerator:
+    order: int = 4
+order=4 なので、「直前4文字を見て、次の1文字を選ぶ」だけです。学習データが722行くらいで、各行も短いので、直前4文字が一致したら次に来る文字がほぼ一意に決まります。その結果、生成文が既存歌詞の行をそのまま再生しやすいです。
+実際に実行結果もこうなっています。
+ペルセウス座流星群 君も見てただろうか。
+夢を追う君へ。
+降り頻る雨でさえ。
+これは「新しい歌詞」ではなく、学習データ中のフレーズ再生に近いです。
+面白くするなら、方向性は3つあります。
+n-gram の order を下げる
+例えば --order 2 にするとコピー感は減ります。ただし文法は少し壊れやすくなります。
+python nn_music_project.py --order 2 --temperature 1.2 --seed-text ""
+
+既存歌詞と完全一致する生成文を弾く
+生成後に、学習データの行と同じものは再生成するようにすれば、「丸コピー」は減ります。
+
+生成テーマを指定できるようにする
+例えば --theme 孤独 や --theme 夏 を入れて、seed や出力評価に使うと、ただの再生よりプロジェクトとして面白くなります。
+
+一番手軽に改善するなら、まずこれです。
+python nn_music_project.py --seed-text "" --order 2 --temperature 1.3 --generate-length 60
+ただ、根本的には今の CharNgramGenerator は「元歌詞っぽい断片を混ぜる機械」なので、プロジェクトとして見せるなら、生成文が既存歌詞とどれくらい被っているかを測る機能 を入れるとかなり良くなります。
+例えば出力にこう出す感じです。
+originality: 0.72
+copied_from_training: false
+そうすると、「生成できました」ではなく、
+既存歌詞をどの程度コピーせずに、アーティストらしさを保てるか
+
+という分析プロジェクトになります。今の分類器ともつながるので、テーマとしてかなり筋が良くなります。
+---
 ## うんちち
 
 ### ヨルシカ
